@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sqlalchemy
+requests
+pydantic
+beautifulsoup4
+selenium
+webdriver-manager
