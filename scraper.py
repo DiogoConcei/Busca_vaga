@@ -1,12 +1,13 @@
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from sqlalchemy.orm import Session
+from bs4 import BeautifulSoup
 import models
 import time
 import random
 import requests
 import os
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 def find_browser_executable():
     """Procura Chrome, Edge ou Brave nos locais padrão ou no registro do Windows."""
@@ -45,13 +46,26 @@ def find_browser_executable():
     return None
 
 def get_driver():
-    """Configura o driver VISÍVEL para máxima compatibilidade."""
+    """Configura o driver VISÍVEL com PERFIL PERSISTENTE para salvar logins."""
     browser_path = find_browser_executable()
     
+    # Caminho para salvar o perfil (cookies, logins, etc)
+    profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selenium_profile")
+    if not os.path.exists(profile_dir):
+        os.makedirs(profile_dir)
+
     def get_options():
         options = uc.ChromeOptions()
         if browser_path:
             options.binary_location = browser_path
+        
+        # ESSENCIAL: Aponta para a pasta onde o login ficará salvo
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--profile-directory=Default")
+        
+        # User-Agent Realista para evitar logout imediato
+        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-blink-features=AutomationControlled")
         return options
@@ -67,13 +81,17 @@ def get_driver():
             if match:
                 v_full = match.group(1)
                 v_main = int(v_full.split('.')[0])
-                print(f"\n[!] Conflito de versão. Forçando driver {v_main} para o navegador em {browser_path}...")
+                print(f"\n[!] Conflito de versão. Forçando driver {v_main}...")
                 driver = uc.Chrome(options=get_options(), version_main=v_main, browser_executable_path=browser_path)
             else:
                 raise e
+        elif "user data directory is already in use" in error_msg.lower():
+            print("\n[!] ERRO: O Chrome do bot já está aberto ou travado.")
+            print("[!] Feche todas as janelas do Chrome abertas pelo bot e tente novamente.")
+            raise e
         else:
             if not browser_path:
-                print("\n[!] ERRO: Nenhum navegador Chromium (Chrome, Edge, Brave) foi encontrado!")
+                print("\n[!] ERRO: Nenhum navegador Chromium encontrado!")
             raise e
 
     driver.set_window_size(1366, 768)
@@ -108,23 +126,33 @@ def scrape_github(db: Session):
     return vagas_novas
 
 def save_page_sample(site_name, termo, html_content):
-    """Salva o HTML da página atual para refinamento posterior."""
+    """Salva o HTML da página atual e limpa versões antigas para economizar espaço."""
     try:
+        import glob
         amostras_dir = os.path.join(os.path.dirname(__file__), "amostras")
         if not os.path.exists(amostras_dir):
             os.makedirs(amostras_dir)
         
-        # Nome do arquivo amigável: site_termo_timestamp.html
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
         termo_slug = termo.replace(" ", "_").lower()
-        filename = f"{site_name.lower()}_{termo_slug}_{timestamp}.html"
+        site_slug = site_name.lower()
+        
+        # 1. FAXINA: Mantém apenas as 3 últimas amostras deste site/termo
+        pattern = os.path.join(amostras_dir, f"{site_slug}_{termo_slug}_*.html")
+        arquivos_antigos = sorted(glob.glob(pattern))
+        if len(arquivos_antigos) >= 3:
+            for f in arquivos_antigos[:-2]: # Mantém os 2 últimos + o que vamos criar agora
+                try: os.remove(f)
+                except: pass
+
+        # 2. SALVAMENTO: Cria a nova amostra
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"{site_slug}_{termo_slug}_{timestamp}.html"
         filepath = os.path.join(amostras_dir, filename)
         
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(html_content)
-        # print(f"      [v] Amostra salva: {filename}")
     except Exception as e:
-        print(f"      [!] Erro ao salvar amostra: {e}")
+        print(f"      [!] Erro na faxina/salvamento de amostra: {e}")
 
 def scrape_selenium_sites(db: Session, driver):
     """Busca em camadas sequenciais para máxima precisão."""
@@ -155,7 +183,7 @@ def scrape_selenium_sites(db: Session, driver):
         {
             "name": "LinkedIn",
             "base_url": "https://www.linkedin.com/jobs/search?keywords={query_encoded}&location=Rio%20de%20Janeiro%2C%20Brasil&f_TPR=r604800",
-            "selectors": ["h3.base-search-card__title", ".base-card__full-link"],
+            "selectors": ["h3.base-search-card__title", ".base-card__full-link", "a.result-card__full-card-link"],
             "loc_selector": ".job-search-card__location"
         }
     ]
@@ -176,7 +204,8 @@ def scrape_selenium_sites(db: Session, driver):
                 time.sleep(random.uniform(5, 8))
 
                 # SALVAMENTO DE AMOSTRA: Guarda o que o bot está vendo agora
-                save_page_sample(site['name'], termo, driver.page_source)
+                save_page_source = driver.page_source
+                save_page_sample(site['name'], termo, save_page_source)
 
                 if "login" in driver.current_url or "authwall" in driver.current_url:
                     print(f"[!] Bloqueio em {site['name']} detectado. Resolva e pressione ENTER...")
@@ -192,13 +221,18 @@ def scrape_selenium_sites(db: Session, driver):
                                 link = item.get_attribute("href")
                                 if not title or not link: continue
                                 
-                                # LIMPEZA DE LINK (Remove parâmetros de rastreio que causam falsas duplicatas)
+                                # LIMPEZA DE LINK
                                 clean_link = link.split('?')[0].split(';')[0]
                                 
+                                # TRATAMENTO PARA LINKS GENÉRICOS (Indeed/LinkedIn redirects)
+                                # Se o link for muito curto ou genérico, mantemos o original com parâmetros para ser único
+                                if len(clean_link) < 30 or "clk" in clean_link:
+                                    clean_link = link
+
                                 if any(kw in title.lower() for kw in kw_tech):
-                                    # VERIFICAÇÃO DE DUPLICIDADE: Busca pelo link limpo no banco
+                                    # VERIFICAÇÃO DE DUPLICIDADE
                                     exists = db.query(models.Vaga).filter(
-                                        (models.Vaga.link == clean_link) | (models.Vaga.link == link)
+                                        (models.Vaga.link == clean_link)
                                     ).first()
 
                                     if not exists:
@@ -214,137 +248,139 @@ def scrape_selenium_sites(db: Session, driver):
                                             titulo=title, empresa=site['name'], link=clean_link,
                                             localizacao=loc, area=termo.split()[-1].capitalize(), status="Novo"
                                         ))
+                                        # Fazemos o commit por vaga para garantir o salvamento e evitar travas
+                                        db.commit()
                                         vagas_novas += 1
                                         found_in_site += 1
-                            except: continue
+                            except Exception as e:
+                                db.rollback() # Reset em caso de erro na vaga específica
+                                continue
                         if found_in_site > 0: break
                 
-                db.commit()
                 time.sleep(random.uniform(2, 4))
 
             except Exception as e:
                 print(f"   [!] Erro em {site['name']}: {e}")
+                db.rollback() # Reset em caso de erro no site
                 continue
             
     return vagas_novas
 
-def scrape_local_samples(db: Session, driver):
+def scrape_local_samples(db: Session):
     """
-    MODO REFINAMENTO: Processa arquivos HTML locais na pasta 'amostras'.
-    Isso permite testar seletores sem ser bloqueado pelos sites reais.
+    MODO REFINAMENTO: Processa arquivos HTML locais usando BeautifulSoup.
+    MAIS RÁPIDO E ESTÁVEL: Evita erros de driver e timeout.
     """
     import glob
     vagas_novas = 0
     amostras_dir = os.path.join(os.path.dirname(__file__), "amostras")
     
     if not os.path.exists(amostras_dir):
-        print(f"\n[!] Pasta de amostras não encontrada em: {amostras_dir}")
         return 0
 
     arquivos = glob.glob(os.path.join(amostras_dir, "*.html"))
     if not arquivos:
-        print("\n[i] Nenhuma amostra (.html) encontrada para processar.")
         return 0
 
     print(f"\n{'='*30}\nMODO REFINAMENTO: PROCESSANDO {len(arquivos)} AMOSTRAS\n{'='*30}")
 
-    # Configurações de sites (mesmas do scrape_selenium_sites para consistência)
     config_sites = {
         "riovagas": {
             "name": "RioVagas",
+            "base_url": "https://www.riovagas.com.br",
             "selectors": ["article h2 a", "h2.entry-title a", ".post-title a"],
-            "loc_selector": ".post-city"
         },
         "indeed": {
             "name": "Indeed",
+            "base_url": "https://br.indeed.com",
             "selectors": ["h2.jobTitle a", "a.jcs-JobTitle"],
-            "loc_selector": ".companyLocation, [data-testid='text-location']"
         },
         "catho": {
             "name": "Catho",
+            "base_url": "https://www.catho.com.br",
             "selectors": ["h2 a", ".Title-module__title___3S2cv a"],
-            "loc_selector": ".sc-kgOKUu a, [data-testid='job-location']"
         },
         "linkedin": {
             "name": "LinkedIn",
-            "selectors": ["h3.base-search-card__title", ".base-card__full-link"],
-            "loc_selector": ".job-search-card__location"
+            "base_url": "https://www.linkedin.com",
+            "selectors": ["h3.base-search-card__title", ".base-card__full-link", "a.result-card__full-card-link"],
         }
     }
 
-    kw_tech = ["estágio", "estagio", "intern", "computação", "ti", "python", "dev", "junior", "software"]
+    kw_tech = ["estágio", "estagio", "intern", "computação", "ti", "python", "dev", "junior", "software", "dados", "react"]
 
     for arquivo_path in arquivos:
         nome_arquivo = os.path.basename(arquivo_path).lower()
-        site_key = None
+        site_key = next((k for k in config_sites if k in nome_arquivo), None)
         
-        # Identifica o site pelo nome do arquivo
-        for key in config_sites.keys():
-            if key in nome_arquivo:
-                site_key = key
-                break
-        
-        if not site_key:
-            print(f"[?] Arquivo ignorado (site não identificado): {nome_arquivo}")
-            continue
+        if not site_key: continue
 
         site = config_sites[site_key]
-        print(f"\n[Amostra] Testando seletores de {site['name']} em: {nome_arquivo}")
+        print(f"\n[Amostra] Refinando {site['name']} via BS4: {nome_arquivo}")
         
-        # Carrega o arquivo local no navegador
-        file_url = "file:///" + os.path.abspath(arquivo_path).replace("\\", "/")
-        driver.get(file_url)
-        time.sleep(2)
+        try:
+            with open(arquivo_path, "r", encoding="utf-8") as f:
+                soup = BeautifulSoup(f.read(), "html.parser")
 
-        achados_nesta_amostra = 0
-        for selector in site['selectors']:
-            items = driver.find_elements(By.CSS_SELECTOR, selector)
-            if items:
-                for item in items:
-                    try:
-                        title = item.text.strip()
-                        link = item.get_attribute("href")
-                        if not title: continue
-                        
-                        # Se achou algo, vamos logar para o usuário ver que o seletor funcionou
-                        if any(kw in title.lower() for kw in kw_tech):
-                            achados_nesta_amostra += 1
-                            if not db.query(models.Vaga).filter(models.Vaga.link == link).first():
-                                db.add(models.Vaga(
-                                    titulo=f"[AMOSTRA] {title}", empresa=site['name'], link=link,
-                                    localizacao="Local/Amostra", area="Refinamento", status="Novo"
-                                ))
-                                vagas_novas += 1
-                    except: continue
-                if achados_nesta_amostra > 0:
-                    print(f"   [OK] Seletor '{selector}' funcionou! Achou {achados_nesta_amostra} vagas.")
-                    break
-        
-        if achados_nesta_amostra == 0:
-            print(f"   [!] ALERTA: Nenhum seletor funcionou para esta amostra de {site['name']}!")
+            achados_nesta_amostra = 0
+            for selector in site['selectors']:
+                items = soup.select(selector)
+                if items:
+                    for item in items:
+                        try:
+                            title = item.get_text(strip=True)
+                            link_raw = item.get("href", "")
+                            if not title or not link_raw: continue
+                            
+                            # Transforma link relativo em absoluto
+                            link = urljoin(site['base_url'], link_raw)
+                            
+                            if any(kw in title.lower() for kw in kw_tech):
+                                # VERIFICAÇÃO DE DUPLICIDADE (Mesmo para amostras)
+                                exists = db.query(models.Vaga).filter(models.Vaga.link == link).first()
+                                
+                                if not exists:
+                                    achados_nesta_amostra += 1
+                                    db.add(models.Vaga(
+                                        titulo=f"[AMOSTRA] {title}", empresa=site['name'], link=link,
+                                        localizacao="Local/Amostra", area="Refinamento", status="Novo"
+                                    ))
+                                    db.commit() # Salva logo para evitar duplicidade na mesma rodada
+                                    vagas_novas += 1
+                        except Exception:
+                            db.rollback()
+                            continue
+                    if achados_nesta_amostra > 0:
+                        print(f"   [OK] Sucesso! Achou {achados_nesta_amostra} vagas.")
+                        break
+            
+            if achados_nesta_amostra == 0:
+                print(f"   [!] Nenhum seletor funcionou para {nome_arquivo}")
+        except Exception as e:
+            print(f"   [!] Erro ao processar amostra: {e}")
+            db.rollback()
 
-    db.commit()
-    print(f"\n{'='*30}\nFIM DO REFINAMENTO: {vagas_novas} vagas importadas das amostras.\n{'='*30}")
+    print(f"\n{'='*30}\nFIM DO REFINAMENTO: {vagas_novas} vagas importadas.\n{'='*30}")
     return vagas_novas
 
 def real_scrape(db: Session):
     total = 0
     total += scrape_github(db)
     
+    # 1. Primeiro tenta as amostras locais SEM usar Selenium (Super rápido e seguro)
+    total += scrape_local_samples(db)
+    
+    # 2. Depois vai para a internet real USANDO Selenium
     driver = None
     try:
         driver = get_driver()
-        
-        # 1. Primeiro tenta as amostras locais (ajuda a verificar se o código está bom)
-        total += scrape_local_samples(db, driver)
-        
-        # 2. Depois vai para a internet real
         total += scrape_selenium_sites(db, driver)
-        
     except Exception as e:
         print(f"Erro no Driver: {e}")
     finally:
-        if driver: driver.quit()
+        if driver: 
+            try: driver.quit()
+            except: pass
 
     print(f"\n=== PROCESSO COMPLETO: {total} NOVAS VAGAS NO TOTAL ===")
 
