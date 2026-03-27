@@ -178,7 +178,7 @@ def analyze_vaga_match(db: Session, titulo: str, localizacao: str = "", descrica
 
     if matching_profile:
         # Insere o perfil no INÍCIO dos highlights para garantir visibilidade
-        highlights.insert(0, f"👤 {matching_profile[:10]}...")
+        highlights.insert(0, f"👤 {matching_profile}")
 
     score = max(0, min(score, 100))
     
@@ -278,7 +278,11 @@ def scrape_selenium_sites(db: Session, driver):
                             continue
 
                         clean_link = link.split('?')[0]
-                        existing_vaga = db.query(Vaga).filter(Vaga.link == clean_link).first()
+                        # NOVO: Verifica por link OU (Título + Empresa) para evitar duplicatas do Indeed/LinkedIn
+                        existing_vaga = db.query(Vaga).filter(
+                            (Vaga.link == clean_link) | 
+                            ((Vaga.titulo == title) & (Vaga.empresa == site['name']))
+                        ).first()
                         
                         if not existing_vaga:
                             # Se for um Hot Match provável, pegamos a descrição
