@@ -6,3 +6,8 @@ pydantic
 beautifulsoup4
 selenium
 webdriver-manager
+python-multipart
+pdfminer.six
+python-docx
+scikit-learn
+undetected-chromedriver
