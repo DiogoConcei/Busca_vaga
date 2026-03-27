@@ -13,6 +13,7 @@ class Vaga(Base):
     empresa: Mapped[str] = mapped_column(String)
     link: Mapped[str] = mapped_column(String, unique=True)
     localizacao: Mapped[str] = mapped_column(String)
+    modalidade: Mapped[str] = mapped_column(String, default="Não Especificado")
     area: Mapped[str] = mapped_column(String)
     data_postagem: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String, default="Novo")

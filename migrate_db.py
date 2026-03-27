@@ -15,7 +15,8 @@ def migrate():
         "match_score": "INTEGER DEFAULT 0",
         "insights": "TEXT",
         "descricao_completa": "TEXT",
-        "keywords_ats": "TEXT"
+        "keywords_ats": "TEXT",
+        "modalidade": "TEXT DEFAULT 'Não Especificado'"
     }
     
     # Colunas que queremos garantir que existem na tabela 'curriculos'

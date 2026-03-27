@@ -121,23 +121,75 @@ def calculate_semantic_score(job_text: str, resume_text: str) -> float:
     except:
         return 0.0
 
-def analyze_vaga_match(db: Session, titulo: str, localizacao: str = "", descricao: str = ""):
-    """IA LOCAL OTIMIZADA com Match Heurístico e Semântico."""
+# Palavras-chave proibidas para evitar ruído não-tech ou áreas de TI fora do escopo (Dev/Dados)
+FORBIDDEN_KEYWORDS = [
+    "direito", "advogado", "jurídico", "administração", "adm", "vendas", 
+    "telemarketing", "atendimento", "comercial", "psicologia", "pedagogia", 
+    "jornalismo", "marketing", "financeiro", "contabilidade", "rh", 
+    "recursos humanos", "culinária", "gastronomia", "enfermagem", "médico",
+    "suporte n1", "suporte n2", "helpdesk", "field service", "manutenção",
+    "redes", "infraestrutura", "infra", "telecom", "hardware", "técnico de informática"
+]
+
+def detect_location_and_modality(text_location: str, description: str = "") -> tuple[str, str]:
+    """Detecta a localização (Cidade) e a modalidade (Remoto/Presencial/Híbrido)."""
+    text_combined = (text_location + " " + description).lower()
+    
+    modality = "Presencial"
+    if any(kw in text_combined for kw in ["remoto", "home office", "anywhere", "distância"]):
+        modality = "Remoto"
+    elif any(kw in text_combined for kw in ["híbrido", "hibrido", "hybrid"]):
+        modality = "Híbrido"
+    
+    # Detecção de Cidade (Foco no Rio de Janeiro)
+    city = "Outras"
+    if any(kw in text_combined for kw in ["rio de janeiro", "rj", "carioca", "capital"]):
+        # Verifica se não é uma cidade do estado com nome parecido ou se é de fato a capital
+        # RioVagas e Indeed costumam ser específicos
+        city = "Rio de Janeiro"
+    elif any(kw in text_combined for kw in ["niterói", "duque de caxias", "são gonçalo", "nova iguaçu"]):
+        city = "Grande RJ"
+    
+    return city, modality
+
+def analyze_vaga_match(db: Session, titulo: str, localizacao_raw: str = "", descricao: str = ""):
+    """IA LOCAL OTIMIZADA com Match Heurístico, Semântico e Geográfico."""
     weights = {
-        "stack_principal": 25, "stack_secundaria": 15, "area_foco": 10, "senioridade_alvo": 30,
+        "stack_principal": 30, # Aumentado
+        "stack_secundaria": 10,
+        "area_foco": 10,
+        "senioridade_alvo": 30,
+        "geografia": 20 # Novo peso
     }
-    techs_main = ["python", "react", "javascript", "js", "typescript", "ts"]
+    
+    techs_main = ["python", "react", "javascript", "js", "typescript", "ts", "data", "dados"]
     techs_sec = ["sql", "fastapi", "node", "git", "css", "html", "docker", "aws", "nosql", "postgres"]
     areas = ["dados", "web", "dev", "software", "frontend", "backend", "fullstack", "computação"]
     target_seniority = ["estágio", "estagio", "intern", "trainee"]
     junior_seniority = ["junior", "jr", "júnior"]
     penalties = ["sênior", "senior", "pleno", "pl", "sr", "lead", "gerente", "manager", "especialista"]
 
-    score = 20
+    score = 0
     highlights = []
     title_lower = titulo.lower()
     
-    # Heurística de Título
+    # 1. Filtro de Localidade e Modalidade
+    city, modality = detect_location_and_modality(localizacao_raw, descricao)
+    
+    if modality == "Remoto":
+        score += weights["geografia"]
+        highlights.append("🌍 Remoto")
+    elif city == "Rio de Janeiro":
+        score += weights["geografia"]
+        highlights.append("📍 Rio de Janeiro")
+    elif city == "Grande RJ":
+        score += weights["geografia"] // 2
+        highlights.append("🏙️ Grande RJ")
+    else:
+        # Penaliza se for presencial fora do RJ
+        score -= 20
+
+    # 2. Heurística de Título e Senioridade
     if any(kw in title_lower for kw in target_seniority):
         score += weights["senioridade_alvo"]
         highlights.append("🎓 Estágio")
@@ -145,6 +197,11 @@ def analyze_vaga_match(db: Session, titulo: str, localizacao: str = "", descrica
         score += weights["senioridade_alvo"] // 2
         highlights.append("🌱 Junior")
 
+    for p in penalties:
+        if f" {p} " in f" {title_lower} " or title_lower.endswith(p):
+            score -= 50 # Penalidade aumentada
+
+    # 3. Stack Técnica
     found_main = [t for t in techs_main if t in title_lower]
     if found_main:
         score += weights["stack_principal"]
@@ -153,31 +210,27 @@ def analyze_vaga_match(db: Session, titulo: str, localizacao: str = "", descrica
     if any(kw in title_lower for kw in areas):
         score += weights["area_foco"]
 
-    for p in penalties:
-        if f" {p} " in f" {title_lower} " or title_lower.endswith(p):
-            score -= 40
-
-    # Match Semântico se tiver Currículo
+    # 4. Match Semântico se tiver Currículo
     curriculos_ativos = db.query(Curriculo).filter(Curriculo.is_active == True).all()
     
     matching_profile = ""
+    semantic_score = 0
     if curriculos_ativos and descricao:
         best_semantic_score = 0
-        
         for curr in curriculos_ativos:
             s_score = calculate_semantic_score(descricao, curr.texto_extraido)
             if s_score > best_semantic_score:
                 best_semantic_score = s_score
-                matching_profile = curr.nome.split('.')[0] # Pega o nome sem extensão
-        
-        # 40% Título / 60% Descrição
-        score = (score * 0.4) + (best_semantic_score * 0.6)
+                matching_profile = curr.nome.split('.')[0]
+        semantic_score = best_semantic_score
     elif curriculos_ativos:
-        # Se não tem descrição para o match semântico, ainda tentamos identificar o perfil ativo principal
         matching_profile = curriculos_ativos[0].nome.split('.')[0]
 
+    # Composição Final do Score (40% Heurística + 60% Semântica se houver descrição)
+    if semantic_score > 0:
+        score = (score * 0.4) + (semantic_score * 0.6)
+    
     if matching_profile:
-        # Insere o perfil no INÍCIO dos highlights para garantir visibilidade
         highlights.insert(0, f"👤 {matching_profile}")
 
     score = max(0, min(score, 100))
@@ -187,8 +240,7 @@ def analyze_vaga_match(db: Session, titulo: str, localizacao: str = "", descrica
     elif score >= 40: insight_text = "📈 Potencial detectado. Confira a descrição."
     else: insight_text = "🔍 Afinidade baixa identificada pela IA."
         
-    # Aumentamos para 4 itens para não cortar o perfil
-    return int(score), " • ".join(highlights[:4]) + " | " + insight_text
+    return int(score), " • ".join(highlights[:4]) + " | " + insight_text, city, modality
 
 def get_full_description(driver, link: str, site_name: str) -> str:
     """Tenta navegar até o link da vaga e extrair o texto completo."""
@@ -197,7 +249,11 @@ def get_full_description(driver, link: str, site_name: str) -> str:
             "RioVagas": ".entry-content, .post-content",
             "Indeed": "#jobDescriptionText, .jobsearch-JobComponent-description",
             "Catho": ".job-description, [class*='JobDescription']",
-            "LinkedIn": ".description__text, .show-more-less-html__markup"
+            "LinkedIn": ".description__text, .show-more-less-html__markup",
+            "Vagas.com": ".vaga-descricao, .job-description",
+            "Infojobs": ".vaga-descricao, .description",
+            "Remotar": ".job-description, .vaga-detalhes",
+            "Trampos": ".opportunity__description"
         }
         
         # Para simplificar, o scraper vai tentar pegar a descrição quando já estiver no card (se possível)
@@ -212,20 +268,16 @@ def scrape_selenium_sites(db: Session, driver):
     """Busca em camadas sequenciais para máxima precisão com expansão de termos."""
     vagas_novas = 0
     
-    # Palavras-chave proibidas para evitar ruído não-tech
-    FORBIDDEN_KEYWORDS = [
-        "direito", "advogado", "jurídico", "administração", "adm", "vendas", 
-        "telemarketing", "atendimento", "comercial", "psicologia", "pedagogia", 
-        "jornalismo", "marketing", "financeiro", "contabilidade", "rh", 
-        "recursos humanos", "culinária", "gastronomia", "enfermagem", "médico"
-    ]
-
-    # Configuração dos sites movida para dentro da função para evitar NameError
+    # Configuração dos sites
     config_sites = [
         {"name": "RioVagas", "base_url": "https://riovagas.com.br/?s={query}", "selectors": ["article h2 a"], "loc_selector": ".post-city"},
         {"name": "Indeed", "base_url": "https://br.indeed.com/jobs?q={query}&l=Rio+de+Janeiro%2C+RJ&sort=date", "selectors": ["h2.jobTitle a"], "loc_selector": ".companyLocation"},
         {"name": "Catho", "base_url": "https://www.catho.com.br/vagas/{query_slug}-rj/?q={query_encoded}", "selectors": ["h2 a"], "loc_selector": ".sc-kgOKUu a"},
-        {"name": "LinkedIn", "base_url": "https://www.linkedin.com/jobs/search?keywords={query_encoded}&location=Rio%20de%20Janeiro%2C%20Brasil", "selectors": ["h3.base-search-card__title, .job-search-card__title, h4.base-search-card__title"], "loc_selector": ".job-search-card__location"}
+        {"name": "LinkedIn", "base_url": "https://www.linkedin.com/jobs/search?keywords={query_encoded}&location=Rio%20de%20Janeiro%2C%20Brasil", "selectors": ["h3.base-search-card__title, .job-search-card__title, h4.base-search-card__title"], "loc_selector": ".job-search-card__location"},
+        {"name": "Vagas.com", "base_url": "https://www.vagas.com.br/vagas-de-{query_slug}-em-rio-de-janeiro?ordenar_por=mais_recentes", "selectors": ["h2.cargo a.link-detalhes-vaga"], "loc_selector": ".vaga-local"},
+        {"name": "Infojobs", "base_url": "https://www.infojobs.com.br/vagas-de-{query_slug}-em-rio-de-janeiro.aspx", "selectors": ["div.vaga h2 a"], "loc_selector": ".location-name"},
+        {"name": "Remotar", "base_url": "https://remotar.com.br/vagas?q={query_encoded}", "selectors": [".card-vaga h2 a, .vaga-card h2 a"], "loc_selector": ".vaga-local"},
+        {"name": "Trampos", "base_url": "https://trampos.co/oportunidades?tr={query_encoded}", "selectors": ["h1.opportunity__title a"], "loc_selector": ".opportunity__address"}
     ]
 
     # Termos base
@@ -239,14 +291,13 @@ def scrape_selenium_sites(db: Session, driver):
         "react": ["frontend", "front", "js", "javascript"]
     }
 
-    # Gera lista final de termos (Base + 1 variação aleatória de cada para diversificar)
+    # Gera lista final de termos
     termos_finais = list(base_termos)
     for b in base_termos:
         for k, v in expansao.items():
             if k in b:
                 termos_finais.append(b.replace(k, random.choice(v)))
     
-    # Remove duplicatas mantendo a ordem
     termos_finais = list(dict.fromkeys(termos_finais))
 
     for termo in termos_finais:
@@ -264,7 +315,7 @@ def scrape_selenium_sites(db: Session, driver):
                 print(f"      [i] {num_encontrados} elementos de vaga detectados.")
                 
                 vagas_site_count = 0
-                for index, item in enumerate(items[:15]): # Aumentado para 15 para maior cobertura
+                for index, item in enumerate(items[:15]):
                     try:
                         title = item.text.strip()
                         link = item.get_attribute("href")
@@ -272,45 +323,65 @@ def scrape_selenium_sites(db: Session, driver):
                         if not title or not link:
                             continue
                         
-                        # FILTRO DE RUÍDO: Ignorar se contiver palavras proibidas
+                        # 1. FILTRO DE RUÍDO: Ignorar se contiver palavras proibidas
                         if any(fk in title.lower() for fk in FORBIDDEN_KEYWORDS):
-                            # print(f"      [!] Pulando Ruído: {title[:30]}...")
                             continue
 
                         clean_link = link.split('?')[0]
-                        # NOVO: Verifica por link OU (Título + Empresa) para evitar duplicatas do Indeed/LinkedIn
                         existing_vaga = db.query(Vaga).filter(
                             (Vaga.link == clean_link) | 
                             ((Vaga.titulo == title) & (Vaga.empresa == site['name']))
                         ).first()
                         
                         if not existing_vaga:
-                            # Se for um Hot Match provável, pegamos a descrição
+                            # 2. Extração de Localização Contextual
+                            loc_raw = ""
+                            try:
+                                # Tenta pegar a localização do card se houver seletor definido
+                                if site.get('loc_selector'):
+                                    parent = item.find_element(By.XPATH, "./ancestor::*[contains(@class, 'card') or self::article or self::div[contains(@class, 'job')]]")
+                                    loc_raw = parent.find_element(By.CSS_SELECTOR, site['loc_selector']).text
+                            except:
+                                loc_raw = "Rio de Janeiro" # Fallback para busca urbana
+
                             desc = ""
                             if site['name'] == "RioVagas":
                                 try: desc = item.find_element(By.XPATH, "./ancestor::article").text
                                 except: pass
                             
-                            score, insight = analyze_vaga_match(db, title, "", desc)
+                            # 3. Análise IA com Geofiltro
+                            score, insight, city, modality = analyze_vaga_match(db, title, loc_raw, desc)
+                            
+                            # Ajuste Especial para o Remotar (Sempre Remoto)
+                            if site['name'] == "Remotar":
+                                modality = "Remoto"
+                                city = "Remoto"
+                                if "🌍 Remoto" not in insight:
+                                    insight = "🌍 Remoto • " + insight
+
+                            # 4. Filtro Severo: Ignorar se não for RJ e não for Remoto
+                            if city == "Outras" and modality != "Remoto":
+                                continue
+
                             db.add(Vaga(
                                 titulo=title, empresa=site['name'], link=clean_link,
-                                localizacao="RJ", area=area_vaga, status="Novo",
+                                localizacao=city, modalidade=modality, area=area_vaga, status="Novo",
                                 match_score=score, insights=insight, 
                                 descricao_completa=desc, keywords_ats=extract_keywords(desc)
                             ))
                             db.commit()
                             vagas_novas += 1
                             vagas_site_count += 1
-                            print(f"      [{index+1}/{min(num_encontrados, 15)}] [+] NOVA: {title[:40]}... | Match: {score}%")
+                            print(f"      [{index+1}/{min(num_encontrados, 15)}] [+] NOVA: {title[:40]}... | {city}/{modality} | {score}%")
                         else:
-                            print(f"      [{index+1}/{min(num_encontrados, 15)}] [-] Repetida: {title[:30]}...")
+                            # print(f"      [{index+1}/{min(num_encontrados, 15)}] [-] Repetida: {title[:30]}...")
+                            pass
                             
                     except Exception as e:
-                        # print(f"      [!] Erro no item {index+1}: {e}")
                         continue
                 
                 if vagas_site_count == 0 and num_encontrados > 0:
-                    print(f"      [✓] Todos os resultados do {site['name']} já estavam no banco.")
+                    print(f"      [✓] Nenhum match novo ou relevante no {site['name']}.")
             except Exception as e:
                 print(f"   [!] Erro crítico no site {site['name']}: {e}")
                 continue
@@ -321,26 +392,44 @@ def scrape_github(db: Session):
     vagas_novas = 0
     repos = ["backend-br/vagas", "frontendbr/vagas", "pythonbrasil/vagas"]
     keywords = ["estágio", "estagio", "intern", "junior"]
-    print("[GitHub] Verificando...")
+    print("\n[GitHub] Iniciando busca em repositórios da comunidade...")
+    
     for repo in repos:
         try:
+            print(f"   -> Verificando {repo}...", end="\r")
             res = requests.get(f"https://api.github.com/repos/{repo}/issues?state=open", timeout=10)
             if res.status_code == 200:
-                for issue in res.json():
+                issues = res.json()
+                vagas_no_repo = 0
+                for issue in issues:
                     title = issue['title']
                     link = issue['html_url']
                     desc = issue.get('body', "")
+                    
                     if any(kw in title.lower() for kw in keywords):
+                        # Verifica se já existe
                         if not db.query(Vaga).filter(Vaga.link == link).first():
-                            score, insight = analyze_vaga_match(db, title, "Remoto", desc)
+                            score, insight, city, modality = analyze_vaga_match(db, title, "Remoto", desc)
                             db.add(Vaga(
-                                titulo=title, empresa="GitHub", link=link, localizacao="Remoto",
-                                area="Comunidade", status="Novo", match_score=score, insights=insight,
+                                titulo=title, empresa="GitHub", link=link, localizacao=city,
+                                modalidade=modality, area="Comunidade", status="Novo", 
+                                match_score=score, insights=insight,
                                 descricao_completa=desc[:2000], keywords_ats=extract_keywords(desc)
                             ))
                             vagas_novas += 1
-                db.commit()
-        except: continue
+                            vagas_no_repo += 1
+                
+                if vagas_no_repo > 0:
+                    print(f"   [+] {repo}: {vagas_no_repo} novas vagas encontradas!        ")
+                else:
+                    print(f"   [✓] {repo}: Sem novidades no momento.                ")
+            elif res.status_code == 403:
+                print(f"   [!] {repo}: Limite de taxa da API do GitHub atingido. Pulando...")
+        except Exception as e:
+            print(f"   [!] Erro ao acessar {repo}: {e}")
+            continue
+    
+    db.commit()
     return vagas_novas
 
 def real_scrape(db: Session):
