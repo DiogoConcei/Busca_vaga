@@ -70,6 +70,7 @@ def get_driver():
         
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        
         return options
     
     try:
@@ -100,13 +101,36 @@ def get_driver():
     return driver
 
 def extract_keywords(text: str) -> str:
-    """Extrai palavras-chave simples de um texto (ATS light)."""
+    """Extrai palavras-chave técnicas de um texto (ATS light)."""
     if not text: return ""
-    words = re.findall(r'\w+', text.lower())
-    stop_words = {'o', 'a', 'os', 'as', 'de', 'do', 'da', 'em', 'um', 'uma', 'e', 'com', 'para', 'que', 'se', 'do', 'da'}
-    keywords = [w for w in words if len(w) > 3 and w not in stop_words]
-    most_common = [w for w, count in Counter(keywords).most_common(15)]
-    return ", ".join(most_common)
+    
+    # Lista expandida de termos técnicos comuns em vagas de dev/dados
+    tech_terms = {
+        "python", "django", "fastapi", "flask", "pandas", "numpy", "sql", "nosql",
+        "react", "angular", "vue", "javascript", "typescript", "node", "express",
+        "html", "css", "sass", "tailwind", "bootstrap", "git", "github", "docker",
+        "kubernetes", "aws", "azure", "gcp", "devops", "ci/cd", "agile", "scrum",
+        "rest", "api", "graphql", "postgresql", "mysql", "mongodb", "redis",
+        "java", "spring", "c#", ".net", "php", "laravel", "ruby", "rails",
+        "go", "rust", "flutter", "react native", "mobile", "ios", "android",
+        "data science", "machine learning", "ia", "ai", "power bi", "tableau"
+    }
+    
+    text_lower = text.lower()
+    found_keywords = []
+    
+    for term in tech_terms:
+        if re.search(rf"\b{re.escape(term)}\b", text_lower):
+            found_keywords.append(term.upper())
+            
+    if not found_keywords:
+        # Fallback para o método anterior se não encontrar termos técnicos específicos
+        words = re.findall(r'\w+', text_lower)
+        stop_words = {'o', 'a', 'os', 'as', 'de', 'do', 'da', 'em', 'um', 'uma', 'e', 'com', 'para', 'que', 'se', 'do', 'da'}
+        keywords = [w for w in words if len(w) > 3 and w not in stop_words]
+        found_keywords = [w.upper() for w, count in Counter(keywords).most_common(10)]
+        
+    return ", ".join(found_keywords[:15])
 
 def calculate_semantic_score(job_text: str, resume_text: str) -> float:
     """Calcula a similaridade entre a vaga e o currículo usando TF-IDF (Local)."""
@@ -280,28 +304,17 @@ def scrape_selenium_sites(db: Session, driver):
         {"name": "Trampos", "base_url": "https://trampos.co/oportunidades?tr={query_encoded}", "selectors": ["h1.opportunity__title a"], "loc_selector": ".opportunity__address"}
     ]
 
-    # Termos base
-    base_termos = ["estagio python", "estagio desenvolvimento", "estagio dados", "estagio react"]
-    
-    # Expansão de Sinônimos para o Scraper
-    expansao = {
-        "python": ["py", "django", "fastapi", "flask"],
-        "dados": ["data", "sql", "bi", "analytics"],
-        "desenvolvimento": ["dev", "software", "web", "programador"],
-        "react": ["frontend", "front", "js", "javascript"]
-    }
-
-    # Gera lista final de termos
-    termos_finais = list(base_termos)
-    for b in base_termos:
-        for k, v in expansao.items():
-            if k in b:
-                termos_finais.append(b.replace(k, random.choice(v)))
-    
-    termos_finais = list(dict.fromkeys(termos_finais))
+    # Termos definidos pelo usuário
+    termos_finais = [
+        "estagio python", "estagio desenvolvimento", "estagio javascript", 
+        "estagio web", "estagio frontend", "estagio backend", 
+        "estagio dados", "estagio analista", "estagio ti",
+        "estagio tecnologia", "estagio sistemas de informação",
+        "estagio computação", "estagio engenharia de software"
+    ]
 
     for termo in termos_finais:
-        print(f"\n[🔍] BUSCA AMPLIADA: {termo.upper()}")
+        print(f"\n[🔍] BUSCA: {termo.upper()}")
         area_vaga = termo.split()[-1].capitalize()
         for site in config_sites:
             try:
@@ -359,9 +372,10 @@ def scrape_selenium_sites(db: Session, driver):
                                 if "🌍 Remoto" not in insight:
                                     insight = "🌍 Remoto • " + insight
 
-                            # 4. Filtro Severo: Ignorar se não for RJ e não for Remoto
-                            if city == "Outras" and modality != "Remoto":
-                                continue
+                            # 4. Filtro Severo (REMOVIDO): Vagas fora do RJ/Remoto agora são salvas (com penalidade de pontuação),
+                            # deixando a decisão de ocultá-las para o usuário no frontend.
+                            # if city == "Outras" and modality != "Remoto":
+                            #     continue
 
                             db.add(Vaga(
                                 titulo=title, empresa=site['name'], link=clean_link,

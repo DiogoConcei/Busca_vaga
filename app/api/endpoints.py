@@ -1,19 +1,44 @@
 import os
 import shutil
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from ..core.db import get_db
+from ..core.db import get_db, SessionLocal
 from ..models.vaga import Vaga, Curriculo
 from ..services.scraper_service import real_scrape
 from ..services.resume_service import parse_resume
 
 router = APIRouter()
 
+# Estado global simples para monitorar o scraper (em produção, use Redis ou similar)
+SCRAPER_STATUS = {"is_running": False, "last_run": None}
+
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+
+def run_background_scrape():
+    global SCRAPER_STATUS
+    SCRAPER_STATUS["is_running"] = True
+    db = SessionLocal()
+    try:
+        real_scrape(db)
+    finally:
+        db.close()
+        SCRAPER_STATUS["is_running"] = False
+
+@router.post("/vagas/atualizar")
+async def update_vagas(background_tasks: BackgroundTasks):
+    if SCRAPER_STATUS["is_running"]:
+        return {"message": "Busca já em andamento", "is_running": True}
+    
+    background_tasks.add_task(run_background_scrape)
+    return {"message": "Busca iniciada em segundo plano", "is_running": True}
+
+@router.get("/scraper/status")
+def get_scraper_status():
+    return SCRAPER_STATUS
 
 @router.get("/vagas", response_model=List[dict])
 def list_vagas(area: Optional[str] = None, db: Session = Depends(get_db)):
@@ -41,11 +66,6 @@ def update_status(vaga_id: int, status: str, db: Session = Depends(get_db)):
     vaga.status = status
     db.commit()
     return {"message": f"Status atualizado para {status}"}
-
-@router.post("/vagas/atualizar")
-def update_vagas(db: Session = Depends(get_db)):
-    real_scrape(db)
-    return {"message": "Busca concluída"}
 
 # --- CURRICULOS ---
 
